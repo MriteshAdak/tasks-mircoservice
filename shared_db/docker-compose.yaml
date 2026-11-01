@@ -1,0 +1,103 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    command: ["postgres", "-p", "5435"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-task_microservices}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-allowing123}
+      PGPORT: "5435"
+    ports:
+      - "${POSTGRES_PORT:-5435}:5435"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -p 5435 -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-task_microservices}"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - shared_net
+
+  user_api_migrate:
+    build:
+      context: ../users_api
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-allowing123}@postgres:5435/${POSTGRES_DB:-task_microservices}
+      USER_API_DB_SCHEMA: ${USER_API_DB_SCHEMA:-users_api}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - shared_net
+
+  task_api_migrate:
+    build:
+      context: ../tasks_api
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-allowing123}@postgres:5435/${POSTGRES_DB:-task_microservices}
+      TASK_API_DB_SCHEMA: ${TASK_API_DB_SCHEMA:-tasks_api}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - shared_net
+
+  user_api:
+    build:
+      context: ../users_api
+      dockerfile: Dockerfile
+    command: ["uvicorn", "src.users_api.main:app", "--host", "0.0.0.0", "--port", "8081", "--reload"]
+    volumes:
+      - ../users_api/src:/app/src
+    ports:
+      - "${USER_API_PORT:-8081}:8081"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-allowing123}@postgres:5435/${POSTGRES_DB:-task_microservices}
+      USER_API_DB_SCHEMA: ${USER_API_DB_SCHEMA:-users_api}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-key-change-in-prod}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      user_api_migrate:
+        condition: service_completed_successfully
+    networks:
+      - shared_net
+
+  task_api:
+    build:
+      context: ../tasks_api
+      dockerfile: Dockerfile
+    command: ["uvicorn", "src.tasks_api.main:app", "--host", "0.0.0.0", "--port", "8082", "--reload"]
+    volumes:
+      - ../tasks_api/src:/app/src
+    ports:
+      - "${TASK_API_PORT:-8082}:8082"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-allowing123}@postgres:5435/${POSTGRES_DB:-task_microservices}
+      TASK_API_DB_SCHEMA: ${TASK_API_DB_SCHEMA:-tasks_api}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-key-change-in-prod}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      task_api_migrate:
+        condition: service_completed_successfully
+    networks:
+      - shared_net
+
+volumes:
+  postgres_data:
+
+networks:
+  shared_net:
+    name: shared_net
