@@ -191,40 +191,74 @@ uv run black --check .
 
 ---
 
-## Improvements in Next Phases
+## Improvements in Next Phase
 
-This section highlights architectural, security, and operational improvements planned for future phases, comparing the current baseline against target industry standards.
+> [!NOTE]
+> For platform-wide improvements (such as the migration to asynchronous `asyncpg` drivers, dual-probe health checks, distributed correlation IDs, and unified containerized testing), refer to the [Root README](../README.md#improvements-in-next-phase-platform-wide).
 
-### 1. Asymmetric Token Issuance (RS256 / JWKS Endpoint)
-* **Current State**: Generates access tokens signed using symmetric HMAC-SHA256 (`HS256`) and a shared `JWT_SECRET`. To verify user identities, downstream microservices (such as `tasks_api`) must possess the exact same secret key, creating a risk where consuming services can forge arbitrary user tokens.
-* **Next Phase Improvement**: Transition to asymmetric cryptography (`RS256` or `ES256`). `users_api` will sign tokens using a private RSA key and expose a public JSON Web Key Set (`GET /.well-known/jwks.json`). Downstream consumers will verify token signatures using the public key alone, establishing zero-trust service boundaries.
+This section details improvements and architectural refinements specific to the **Users API**, comparing the current baseline against target industry standards.
 
-### 2. Event-Driven User Lifecycle Notifications (Publishing `UserDeleted`)
-* **Current State**: The `DELETE /users/{username}` endpoint deletes user credentials and the profile record within `users_api` in isolation. There is no notification sent to dependent services, resulting in orphaned records in services like `tasks_api`.
-* **Next Phase Improvement**: Integrate an event publisher (using RabbitMQ, Redis Streams, or AWS SNS/SQS) that broadcasts a `UserDeleted` event when an account is removed, allowing downstream services to purge or soft-delete user-owned resources asynchronously.
+### 1. Service-Specific Improvements
 
-### 3. Deep Health & Readiness Probes (`/health/live` vs. `/health/ready`)
-* **Current State**: The `/health` endpoint returns a static `{"status": "ok"}` response without checking if PostgreSQL is reachable or able to process queries.
-* **Next Phase Improvement**: Separate health checks into:
-  * `GET /health/live`: Fast process liveness probe.
-  * `GET /health/ready`: Deep readiness probe executing a lightweight SQL query (`SELECT 1`) to ensure database connectivity before orchestrators route traffic to the container.
+#### A. Asymmetric Key Lifecycle & JWKS Provider (`/.well-known/jwks.json`)
+* **Current State**: Generates access tokens using a symmetric HMAC-SHA256 (`HS256`) secret key shared with downstream microservices. Consuming services that verify tokens hold the secret necessary to forge tokens.
+* **Next Phase Improvement**: Act as an OpenID Connect (OIDC)-style Identity Provider:
+  * Sign tokens using an asymmetric private RSA/ECDSA key (`RS256` or `ES256`).
+  * Expose a public JSON Web Key Set endpoint (`GET /.well-known/jwks.json`) supporting automated key rotation, allowing downstream consumers to verify tokens securely without access to private signing keys.
 
-### 4. Asynchronous Database Driver & Native Async Sessions
-* **Current State**: The application uses synchronous SQLAlchemy with `psycopg2-binary` (`engine = create_engine(...)`) and synchronous route functions (`def register_user(...)`). FastAPI executes these functions in a threadpool worker, increasing memory and context-switching overhead under heavy traffic.
-* **Next Phase Improvement**: Upgrade database connectivity to `asyncpg` (`postgresql+asyncpg://`) with SQLAlchemy's `AsyncSession` and native `async def` route handlers for non-blocking I/O and improved request throughput.
+#### B. Event-Driven User Lifecycle Publishing
+* **Current State**: `DELETE /users/{username}` removes credentials and user records in isolation. No event is emitted to inform dependent services of the deletion.
+* **Next Phase Improvement**: Implement a transactional outbox pattern to broadcast lifecycle events (`UserRegistered`, `UserUpdated`, `UserDeleted`) to a platform event broker (RabbitMQ, Redis Streams, or AWS SNS). This enables decoupled microservices to clean up dependent resources automatically.
 
-### 5. Distributed Tracing & Request Correlation
-* **Current State**: `asgi-correlation-id` and `structlog` are defined in `pyproject.toml`, but neither is activated in `users_api.main:create_app`. Distributed requests cannot be correlated across service boundaries.
-* **Next Phase Improvement**: Register `CorrelationIdMiddleware` to automatically extract or generate `X-Request-ID` headers, and format application logs as structured JSON containing the active `request_id`.
+#### C. Refresh Token Rotation & Session Invalidation
+* **Current State**: Issues only short-lived access tokens (15-minute default). There is no refresh token flow, session store, or mechanism to invalidate compromised tokens prior to expiration.
+* **Next Phase Improvement**:
+  * Implement an OAuth2 refresh token flow issuing single-use, rotating refresh tokens stored with cryptographically secure family tracking.
+  * Maintain a Redis-backed session revocation list to immediately invalidate all active tokens when a user logs out, resets credentials, or has their account suspended.
 
-### 6. Refresh Token Rotation & Token Revocation
-* **Current State**: Only short-lived access tokens (15-minute default) are issued upon login. There is no refresh token mechanism, nor is there a token blocklist/revocation store when a user account is deleted or credentials are changed.
-* **Next Phase Improvement**: Implement secure HTTP-only refresh token rotation and a Redis-backed token revocation/invalidation list to immediately revoke active sessions upon password reset or account deletion.
+#### D. Brute-Force Protection, Rate Limiting & Account Lockout
+* **Current State**: Authentication and registration endpoints (`/auth/login`, `/users`) have no rate limiting or failed attempt tracking.
+* **Next Phase Improvement**: Add IP-based and username-based rate limiting (via `slowapi` or Redis sliding-window limiters). Lock accounts temporarily after successive failed authentication attempts to protect against credential stuffing and brute-force attacks.
 
-### 7. Automated Test Suite
-* **Current State**: No automated test cases exist under `tests/`.
-* **Next Phase Improvement**: Implement automated testing with `pytest` and `httpx`:
-  * Unit tests for password validation rules, display name constraints, and username formatting.
-  * Integration tests for `/auth/login`, `/auth/me`, and `/users` CRUD operations with an isolated test database.
+---
+
+### 2. Authorization & Access Control Elements
+
+As the identity provider for the platform, `users_api` is responsible for defining user privileges, assigning roles, and minting authorization claims into tokens.
+
+#### A. Role Management & Claims Issuance (RBAC Core)
+* **Current State**: The `users` model only stores identity attributes (`username`, `display_name`). Tokens contain only `sub` and `username`.
+* **Next Phase Improvement**:
+  * Add a `roles` table or schema enum (`user`, `admin`, `auditor`, `service_account`) and a user-role mapping in the database.
+  * Embed active user roles directly into access token claims:
+    ```json
+    {
+      "sub": "8c46002f-2c70-43be-8e01-1ad6b8408ec2",
+      "username": "johndoe",
+      "roles": ["user"],
+      "permissions": ["tasks:read", "tasks:write"]
+    }
+    ```
+  * Downstream services can immediately enforce role-based decisions without querying `users_api` on every request.
+
+#### B. Permission Scopes Generation
+* **Current State**: No concept of scopes or permissions exists in the authentication payload.
+* **Next Phase Improvement**:
+  * Map roles to granular permissions (e.g., `admin` -> `["tasks:*", "users:*"]`; `user` -> `["tasks:read", "tasks:write", "users:me"]`).
+  * Add scope request negotiation to the `/auth/login` endpoint so clients can request minimal required privileges for specific sessions.
+
+#### C. Account Lifecycle States & Access Invalidation
+* **Current State**: Users are either present or deleted. There are no intermediate account states.
+* **Next Phase Improvement**:
+  * Add an `account_status` column to the `users` table (`active`, `suspended`, `pending_verification`, `locked`).
+  * Reject login and refresh attempts for any user whose status is not `active`.
+  * Broadcast `UserSuspended` events immediately to purge active sessions across the platform.
+
+#### D. Administrative User Management Endpoints
+* **Current State**: Any user can delete their username via `DELETE /users/{username}` without role verification. There is no administrative endpoint to list all users, view status, or reassign privileges.
+* **Next Phase Improvement**:
+  * Restrict user deletion and role assignment endpoints to callers with the `admin` role (`Depends(require_role("admin"))`).
+  * Standardize user self-service actions under `/users/me` rather than arbitrary username path parameters.
+
 
 

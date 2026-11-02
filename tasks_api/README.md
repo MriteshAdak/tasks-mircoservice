@@ -191,40 +191,63 @@ uv run black --check .
 
 ---
 
-## Improvements in Next Phases
+## Improvements in Next Phase
 
-This section highlights architectural, security, and operational improvements planned for future phases, comparing the current baseline against target industry standards.
+> [!NOTE]
+> For platform-wide improvements (such as the migration to asynchronous `asyncpg` drivers, dual-probe health checks, distributed correlation IDs, and unified containerized testing), refer to the [Root README](../README.md#improvements-in-next-phase-platform-wide).
 
-### 1. Asymmetric Token Verification (RS256 / JWKS)
-* **Current State**: Validates incoming JWT bearer tokens using a symmetric secret (`JWT_SECRET`) and algorithm `HS256`. This means `tasks_api` possesses the shared secret key capable of forging valid authentication tokens for any user or identity across the entire system.
-* **Next Phase Improvement**: Migrate to asymmetric verification (`RS256` or `ES256`). `tasks_api` will only maintain the public key (or retrieve key sets dynamically from `users_api` via a `/.well-known/jwks.json` endpoint). This eliminates shared secret leakage and enforces strict zero-trust boundaries between services.
+This section details improvements and architectural refinements specific to the **Tasks API**, comparing the current baseline against target industry standards.
 
-### 2. Distributed Tracing & Request Correlation
-* **Current State**: `asgi-correlation-id` and `structlog` are included as dependencies in `pyproject.toml`, but neither is wired into `tasks_api.main:create_app`. As a result, incoming requests lack an `X-Request-ID` correlation header, and log records cannot be traced back across service boundaries.
-* **Next Phase Improvement**: Register `CorrelationIdMiddleware` in FastAPI and configure structured JSON logging (`structlog` or custom log formatters) to bind and emit `request_id` across all application log statements.
+### 1. Service-Specific Improvements
 
-### 3. Deep Health & Readiness Probes (`/health/live` vs. `/health/ready`)
-* **Current State**: The `/health` endpoint returns a hardcoded `{"status": "ok"}` without testing database connectivity or query execution. If the PostgreSQL connection pool is saturated or the database goes offline, orchestrators continue routing traffic to broken instances.
-* **Next Phase Improvement**: Split into two distinct endpoints:
-  * `GET /health/live`: Fast, shallow process liveness probe.
-  * `GET /health/ready`: Deep readiness probe that issues a lightweight query (`SELECT 1`) against PostgreSQL to verify database connectivity before receiving traffic.
+#### A. Event-Driven Lifecycle Consumption (Handling `UserDeleted` Events)
+* **Current State**: There is no inter-service communication or message subscription. When a user is deleted in `users_api`, their associated task records remain permanently orphaned in the `tasks_api` schema.
+* **Next Phase Improvement**: Implement an asynchronous message consumer (e.g., subscribing to a `user.deleted` topic via RabbitMQ, Redis, or AWS SQS). When received, `tasks_api` will execute a cascading soft-delete or purge of all task records belonging to that `user_id`.
 
-### 4. Asynchronous Database Driver & Native Async Sessions
-* **Current State**: The service uses synchronous SQLAlchemy with `psycopg2-binary` (`engine = create_engine(...)`) and synchronous route handlers (`def create_task(...)`). FastAPI executes these synchronous handlers in a background worker threadpool, adding thread context-switching overhead under high concurrency.
-* **Next Phase Improvement**: Adopt `asyncpg` (`postgresql+asyncpg://`) and SQLAlchemy's `AsyncSession` alongside native `async def` route handlers to enable fully non-blocking I/O across all database queries.
+#### B. Task Status State Machine & Workflow Transitions
+* **Current State**: The `status` field accepts any valid `TaskStatus` enum value (`todo`, `in_progress`, `done`) on updates without transition validation (e.g., a task can jump directly from `todo` to `done` or revert arbitrarily without audit records).
+* **Next Phase Improvement**: Introduce a formal state machine inside `TaskService` with explicit transition rules (e.g., `todo` -> `in_progress` -> `done`), automated timestamp capture (`started_at`, `completed_at`), and status change event emission.
 
-### 5. Event-Driven Lifecycle Consumption (Orphan Task Cleanup)
-* **Current State**: There is no inter-service communication or message broker between `users_api` and `tasks_api`. When a user account is deleted in `users_api`, their associated task records remain permanently orphaned in the `tasks_api` database schema.
-* **Next Phase Improvement**: Introduce an event subscriber (using RabbitMQ, Redis Streams, or AWS SQS) that listens for a `UserDeleted` domain event and executes automated task cleanup or cascading soft-deletes.
+#### C. Full-Text Search, Advanced Filtering & Tagging
+* **Current State**: Tasks can only be filtered by exact `status` match and sorted across four static columns. Searching tasks by keywords requires full-table client-side inspection.
+* **Next Phase Improvement**: Add PostgreSQL full-text search indexing (`to_tsvector`) on `title` and `description`, support tag-based filtering (`tags: list[str]`), priority levels (`low`, `medium`, `high`, `urgent`), and overdue/due-date range queries.
 
-### 6. Dependency Pruning & Environment Hygiene
-* **Current State**: `pyproject.toml` contains dependencies that are not utilized in `tasks_api`, including `pwdlib[argon2]` (password hashing is only required by `users_api`) and `boto3` / `mangum` without an active AWS Lambda CI/CD pipeline.
-* **Next Phase Improvement**: Prune unused dependencies from `pyproject.toml` and re-export `requirements.txt` to minimize container image attack surface and installation times.
+#### D. Dependency Pruning & Container Minimization
+* **Current State**: `pyproject.toml` packages dependencies unneeded by `tasks_api`, including `pwdlib[argon2]` (password hashing is only performed in `users_api`) and `boto3` / `mangum` without an active AWS Lambda CI/CD workflow.
+* **Next Phase Improvement**: Remove extraneous libraries from `pyproject.toml` and re-export a minimal `requirements.txt` to decrease Docker image size, build duration, and security attack surface.
 
-### 7. Automated Test Suite
-* **Current State**: No automated unit or integration tests exist in the repository despite `pytest` being configured in `pyproject.toml`.
-* **Next Phase Improvement**: Implement comprehensive test suites:
-  * Unit tests for `TaskService` business rules and validation logic (due date validation, title length, status transitions).
-  * Integration tests for `/tasks` HTTP endpoints using `httpx.AsyncClient` with a test database container.
+---
+
+### 2. Authorization & Access Control Elements
+
+The Tasks API currently enforces a single access rule: the token subject (`sub`) must match `task.user_id`. The next phase will introduce a multi-layered access control framework:
+
+#### A. Granular Task Scopes
+* **Current State**: Any valid token can perform all operations (read, create, update, delete) on tasks owned by the caller.
+* **Next Phase Improvement**: Enforce OAuth2-style permission scopes on endpoints using FastAPI's `Security(get_current_user, scopes=[...])`:
+  * `tasks:read`: Read-only access to task lists and details.
+  * `tasks:write`: Permission to create and update tasks.
+  * `tasks:delete`: Permission to permanently delete tasks.
+  * `tasks:admin`: Administrative override to manage tasks across all users.
+
+#### B. Resource Ownership & Collaboration Policies (ABAC)
+* **Current State**: Strict 1:1 ownership (`WHERE user_id = :user_id`). Tasks cannot be shared, assigned to team members, or viewed by collaborators.
+* **Next Phase Improvement**: Implement Attribute-Based Access Control (ABAC) allowing collaborative task management:
+  * **Role Differentiation**: Distinguish between `owner_id` (creator) and `assignee_id` (worker).
+  * **Collaborator Access**: Add a `task_members` mapping with permissions (`viewer`, `editor`).
+  * **Access Policy**: Allow read access if `user_id IN (owner_id, assignee_id, collaborators)`; allow edit access only if `user_id == owner_id` or user has `editor` role on the task.
+
+#### C. Admin Override & Cross-User Auditing
+* **Current State**: Querying a task owned by another user always returns `404 Not Found`, even for administrators or support personnel.
+* **Next Phase Improvement**:
+  * Check the `roles` claim in the verified token. If `admin` is present, bypass the `user_id` query filter to allow inspecting or reassigning tasks across users.
+  * Emit an immutable structured audit log entry whenever an administrative user accesses or modifies another user's task.
+
+#### D. State-Based Immutability & Archival Protection
+* **Current State**: Any task, regardless of age or completion status, can be updated or deleted.
+* **Next Phase Improvement**: Enforce state-based authorization policies:
+  * Lock tasks marked as `archived` or `completed` older than a configurable retention period from routine edits.
+  * Require explicit `tasks:reopen` or `tasks:admin` permissions to modify locked or completed tasks.
+
 
 
