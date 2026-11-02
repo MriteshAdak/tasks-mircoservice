@@ -1,0 +1,61 @@
+[project]
+name = "users-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "MriteshAdak", email = "mriteshadak@outlook.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "asgi-correlation-id==4.3.4",
+    "boto3==1.43.6",
+    "fastapi[standard]==0.136.1",
+    "mangum==0.21.0",
+    "psycopg2-binary==2.9.12",
+    "pwdlib[argon2]>=0.3.1",
+    "pyjwt>=2.13.0",
+    "python-dotenv==1.2.2",
+    "sqlalchemy==2.0.49",
+    "structlog==25.5.0",
+]
+
+[project.scripts]
+users-api = "users_api:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+db = [
+    "alembic==1.18.4",
+]
+dev = [
+    "black>=26.5.1",
+    "httpx>=0.28.1",
+    "isort>=8.0.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 88
+select = [
+    "E",   # Pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # Import sorting (replaces isort)
+    "UP",  # Pyupgrade
+    "B",   # Bugbear
+]
+ignore = []
+fix = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
